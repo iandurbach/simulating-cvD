@@ -1,0 +1,270 @@
+# http://archived.mhermans.net/hiking-gpx-r-leaflet.html
+# https://hansenjohnson.org/post/leaflet-map-with-inset-in-r/
+# https://rstudio.github.io/leaflet/morefeatures.html
+
+library(shiny)
+
+library(tidyverse)
+library(tidyr)
+library(sf)
+library(mapview)
+library(leaflet)
+library(htmltools)
+library(raster)
+library(secr)
+library(secrdesign)
+library(furrr)
+
+source("simulate_capthists.R")
+source("cv-utils.R")
+
+ui <- bootstrapPage(
+  tags$style(type = "text/css", "html, body {width:100%;height:100%}"),
+  leafletOutput("map", width = "100%", height = "100%"),
+  absolutePanel(top = 100, left = 10,
+                fluidRow(
+                  column(3, fileInput("trap_file",
+                                      "File for traps")),
+                  column(3, fileInput("region_file",
+                                      "File for meshes"))),
+                fluidRow(
+                  column(3, numericInput("nsims",
+                                         "Simulations to run",
+                                         min = 1,
+                                         value = 3)),
+                  column(3, numericInput(inputId = "dens_per_100km2",
+                                         label = "Expected D",
+                                         min = 0,
+                                         value = 1.5))),
+                fluidRow(
+                  column(3, numericInput(inputId = "lambda0",
+                                         label = "Expected lambda",
+                                         min = 0,
+                                         value = 1.5)),
+                  column(3, numericInput(inputId = "sigma",
+                                         label = "Expected sigma",
+                                         min = 0,
+                                         value = 4000))),
+                fluidRow(
+                  column(3, textInput(inputId = "cov_ac",
+                                      label = "Name of density covariate",
+                                      value = "stdGC")),
+                  column(3, numericInput(inputId = "b_ac",
+                                         label = "Coeff. of density covariate",
+                                         min = 0,
+                                         value = 0))),
+                fluidRow(
+                  column(3, textInput(inputId = "cov_con",
+                                      label = "Name of conductance covariate",
+                                      value = "stdGC")),
+                  column(3, numericInput(inputId = "b_con",
+                                         label = "Coeff. of conductance covariate",
+                                         min = 0,
+                                         value = 0))),
+                selectInput("basemap","Base map",
+                            choices = list("Esri.WorldStreetMap", "Esri.WorldImagery", "OpenStreetMap"),
+                            selected = "Esri.WorldStreetMap"),
+                div(actionButton(inputId = "add_region", label = "Add region"),
+                    actionButton(inputId = "run_sim_ch", label = "Simulate histories"),
+                    actionButton(inputId = "sim_mods", label = "Run SCR"),
+                    style = "margin:2px")),
+  absolutePanel(top = 10, right = 10, 
+                fluidRow(
+                  column(6, tableOutput("ch")))),
+  absolutePanel(top = 200, right = 10, 
+                fluidRow(
+                  column(12, tableOutput("cv")))),
+  absolutePanel(bottom = 10, left = -50,
+                fluidRow(column(3, offset = 5, align="center",
+                                downloadButton("downloadData", "Download results"))))
+)
+
+# Define server logic
+server <- function(input, output, session) {
+  
+  all_region_mesh <- list()
+  all_region_traps <- list()
+  all_region_pars <- data.frame(mesh_reduce = as.numeric(),
+                                dens_per_100km2 = as.numeric(),
+                                b_ac = as.numeric(),
+                                cov_ac = as.character(),
+                                b_con = as.numeric(),
+                                cov_con = as.character(),
+                                lambda0 = as.numeric(),
+                                sigma = as.numeric(),
+                                n_occasions = as.numeric())
+  
+  region_data <- eventReactive(input$add_region, {
+    
+    region_mesh <- readRDS(input$region_file$datapath)
+    region_traps <- readRDS(input$trap_file$datapath)
+    
+    if(!is.null(names(region_mesh))){
+      region_mesh <- list(region_mesh)
+      region_traps <- list(region_traps)
+    }
+    
+    # reduce mesh size (set mesh_reduce = rep(1, nregions) for no reduction)
+    region_mesh <- reduce_mesh_size(mesh = region_mesh, mesh_reduce = c(3,3,3), cov_ac = rep(input$cov_ac,3), cov_con = rep(input$cov_con,3))
+    
+    region_mesh_sf <- list()
+    region_traps_sf <- list()
+    for(i in 1:length(region_mesh)){
+      # make the mesh an sf object
+      region_mesh_tmp <- raster::raster(region_mesh[[i]], covariate = input$cov_ac, values = 1, crs = NA)
+      region_mesh_tmp <- as(region_mesh_tmp,'SpatialPolygonsDataFrame')
+      region_mesh_sf[[i]] <- st_as_sf(region_mesh_tmp, crs = "+proj=utm +zone=48 +datum=WGS84 +units=m +no_defs")
+      region_mesh_sf[[i]] <- region_mesh_sf[[i]] %>% st_set_crs("+proj=utm +zone=48 +datum=WGS84 +units=m +no_defs")
+      rm(region_mesh_tmp)
+      
+      # make the traps an sf object
+      region_traps_sf[[i]] <- st_as_sf(region_traps[[i]], coords = c("x","y"))
+      region_traps_sf[[i]] <- region_traps_sf[[i]] %>% st_set_crs("+proj=utm +zone=48 +datum=WGS84 +units=m +no_defs")
+    }
+    
+    region_pars <- data.frame(mesh_reduce = rep(1,length(region_mesh)),
+                              dens_per_100km2 = rep(input$dens_per_100km2,length(region_mesh)),
+                              b_ac = rep(input$b_ac,length(region_mesh)),
+                              cov_ac = rep(input$cov_ac,length(region_mesh)),
+                              b_con = rep(input$b_con,length(region_mesh)),
+                              cov_con = rep(input$cov_con,length(region_mesh)),
+                              lambda0 = rep(input$lambda0,length(region_mesh)),
+                              sigma = rep(input$sigma,length(region_mesh)),
+                              n_occasions = rep(1,length(region_mesh)))
+    
+    return(list(region_mesh = region_mesh, region_mesh_sf = region_mesh_sf, 
+                region_traps = region_traps, region_traps_sf = region_traps_sf,
+                region_pars = region_pars))
+    
+  })
+  
+  update_region_lists <- reactiveValues()
+  
+  observeEvent(region_data(), {
+    update_region_lists$all_region_mesh <- c(isolate(update_region_lists$all_region_mesh), isolate(region_data()$region_mesh))
+    update_region_lists$all_region_traps <- c(isolate(update_region_lists$all_region_traps), isolate(region_data()$region_traps))
+    update_region_lists$all_region_pars <- rbind(isolate(update_region_lists$all_region_pars), isolate(region_data()$region_pars))
+  })
+  
+  capture_histories <- eventReactive(input$run_sim_ch, {
+    
+    traps <- list()
+    for(i in 1:length(update_region_lists$all_region_mesh)){
+      traps[[i]] <- read.traps(data = update_region_lists$all_region_traps[[i]], detector = "count", binary.usage = FALSE)
+    }
+    
+    # simulate several capture histories in each region
+    sim_ch <- purrr::map(1:input$nsims, simulate_capthists,
+                         mesh = update_region_lists$all_region_mesh,
+                         traps = traps,
+                         n_pts = rep(NULL, length(traps)),
+                         dens_per_100km2 = update_region_lists$all_region_pars$dens_per_100km2,
+                         b_ac = update_region_lists$all_region_pars$b_ac,
+                         cov_ac = update_region_lists$all_region_pars$cov_ac,
+                         b_con = update_region_lists$all_region_pars$b_con,
+                         cov_con = update_region_lists$all_region_pars$cov_con,
+                         lambda0 = update_region_lists$all_region_pars$lambda0,
+                         sigma = update_region_lists$all_region_pars$sigma,
+                         n_occasions = rep(1, length(traps)))
+    
+    
+    # inspect simulated capthists
+    chs <- purrr::map(sim_ch, ~.x[["ch"]])
+    n_detections <- c()
+    n_recaps <- c()
+    for(i in 1:length(chs)){
+      for(j in 1:length(chs[[1]])){
+        n_dets <- c(n_detections, summary(chs[[i]][[j]])$counts$Total[4])
+        n_recaps <- c(n_recaps, summary(chs[[i]][[j]])$counts$Total[6])
+      }
+    }
+    summary_sim_ch <- data.frame(sim_id = rep(1:length(chs), each = length(chs[[1]])),
+                                 region = rep(1:length(chs[[1]]), times = length(chs)),
+                                 n_dets, n_recaps)
+    
+    return(list(sim_ch = sim_ch, summary_sim_ch = summary_sim_ch))
+    
+  })
+  
+  fitted_models <- eventReactive(input$sim_mods, {
+    
+    mods <- purrr::map(capture_histories()$sim_ch, ~ pmap(list(capthist = .$ch, mask = update_region_lists$all_region_mesh, start = .$startvals),
+                                                          secr.fit, detectfn = "HHN", model = list(D ~ 1)), .progress = TRUE)
+    
+    # calculate cv's
+    
+    # calculate Nhat and se.Nhat for each fitted model
+    NpR_est <- matrix(NA, nrow = length(mods), ncol = length(mods[[1]]))
+    NpR_se <- matrix(NA, nrow = length(mods), ncol = length(mods[[1]]))
+    for(i in 1:length(mods)){
+      N_per_region <- purrr::map(mods[[i]], region.N)
+      NpR_est[i, ] <- N_per_region %>% purrr::map(~.x[["estimate"]][1]) %>% unlist()
+      NpR_se[i, ] <- N_per_region %>% purrr::map(~.x[["SE.estimate"]][1]) %>% unlist()
+    }
+    
+    # calculate CV of each Nhat i.e. each region, each simulation
+    cv <- NpR_se / NpR_est
+    
+    # calculate overall Nhat, Nhat.se, and cv for each simulation
+    globalE.N <- apply(NpR_est, 1, sum)
+    globalE.N_se <- apply(NpR_se, 1, function(x) sqrt(sum(x^2)))
+    globalcv <- globalE.N_se / globalE.N
+    
+    # make cv into df
+    cv_res <- data.frame(sim_id = rep(1:nrow(cv), each = ncol(cv)),
+                         region = rep(1:ncol(cv), times = nrow(cv)),
+                         cv = as.vector(cv))
+    
+    return(list(mods = mods, cv = cv_res, globalcv = globalcv))
+    
+  })
+  
+  # only include aspects of the map that won't need to change dynamically
+  output$map <- renderLeaflet({
+    leaflet() %>% addTiles() %>%
+      flyToBounds(100, 42, 103, 50)
+  })
+  
+  # purrr::reduce(mesh_sf, rbind)
+  
+  observe({
+    leafletProxy("map") %>%
+      addPolygons(data = st_transform(purrr::reduce(region_data()$region_mesh_sf, rbind), crs = 4326), fillOpacity = 0.2, weight = 1) %>%
+      addCircleMarkers(data = st_transform(purrr::reduce(region_data()$region_traps_sf, rbind), crs = 4326), radius = 1, color = "red")
+  })
+  
+  output$ch <- renderTable({
+    capture_histories()$summary_sim_ch %>% group_by(region) %>% summarize(`N.animals` = round(mean(n_dets)),
+                                                                          `N.recaps` = round(mean(n_recaps)))
+  })
+  
+  output$cv <- renderTable({
+    rbind(fitted_models()$cv %>% group_by(region) %>% summarize(CV = mean(cv)), 
+          data.frame(region = "all", CV = mean(fitted_models()$globalcv)))
+  })
+  
+  # downloadable RData file with results
+  output$downloadData <- downloadHandler(
+    filename = function() {
+      paste0("cv_results.RData")
+    },
+    content = function(file) {
+      ex <- existing_pts() %>% st_set_geometry(NULL) %>% mutate(status = "existing") %>% select(pt_id, lat, lng, status, stratum_id, gridcell_id)
+      new <- new_pts() %>% st_set_geometry(NULL) %>% mutate(status = "new") %>% select(pt_id, lat, lng, status, stratum_id, gridcell_id)
+      mesh <- update_region_lists$all_region_mesh
+      traps <- update_region_lists$all_region_traps
+      pars <- update_region_lists$all_region_pars
+      capthists <- capture_histories()$sim_ch
+      models <- fitted_models()$mods
+      cvs <- fitted_models()$cv
+      globalcv <- fitted_models()$globalcv
+      cv_results <- list(mesh = mesh, traps = traps, pars = pars, capthists = capthists, models = models, cvs = cvs, globalcv = globalcv)
+      save(cv_results, file)
+    }
+  )
+  
+}
+
+# Run the application
+shinyApp(ui = ui, server = server)
+
