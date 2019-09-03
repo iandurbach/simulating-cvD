@@ -1,7 +1,3 @@
-# http://archived.mhermans.net/hiking-gpx-r-leaflet.html
-# https://hansenjohnson.org/post/leaflet-map-with-inset-in-r/
-# https://rstudio.github.io/leaflet/morefeatures.html
-
 library(tidyverse)
 library(tidyr)
 library(sf)

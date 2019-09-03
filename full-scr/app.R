@@ -1,7 +1,3 @@
-# http://archived.mhermans.net/hiking-gpx-r-leaflet.html
-# https://hansenjohnson.org/post/leaflet-map-with-inset-in-r/
-# https://rstudio.github.io/leaflet/morefeatures.html
-
 library(shiny)
 
 library(tidyverse)
@@ -13,7 +9,6 @@ library(htmltools)
 library(raster)
 library(secr)
 library(secrdesign)
-library(furrr)
 
 source("simulate_capthists.R")
 source("cv-utils.R")
@@ -33,7 +28,7 @@ ui <- bootstrapPage(
                                          min = 1,
                                          value = 3)),
                   column(3, numericInput(inputId = "dens_per_100km2",
-                                         label = "Expected D",
+                                         label = "Expected D/100km2",
                                          min = 0,
                                          value = 1.5))),
                 fluidRow(
@@ -74,9 +69,9 @@ ui <- bootstrapPage(
   absolutePanel(top = 200, right = 10, 
                 fluidRow(
                   column(12, tableOutput("cv")))),
-  absolutePanel(bottom = 10, left = -50,
-                fluidRow(column(3, offset = 5, align="center",
-                                downloadButton("downloadData", "Download results"))))
+  absolutePanel(bottom = 20, left = 10,
+                div(downloadButton("downloadHists", "Download capthists"),
+                    downloadButton("downloadModels", "Download all")))
 )
 
 # Define server logic
@@ -234,23 +229,41 @@ server <- function(input, output, session) {
   })
   
   output$ch <- renderTable({
-    capture_histories()$summary_sim_ch %>% group_by(region) %>% summarize(`N.animals` = round(mean(n_dets)),
-                                                                          `N.recaps` = round(mean(n_recaps)))
-  })
+    capture_histories()$summary_sim_ch %>% group_by(region) %>% summarize(N.min = min(n_dets),
+                                                                          N.mean = mean(n_dets),
+                                                                          N.max = max(n_dets),
+                                                                          R.min = min(n_recaps),
+                                                                          R.mean = mean(n_recaps),
+                                                                          R.max = max(n_recaps))
+  }, digits = 0)
   
   output$cv <- renderTable({
     rbind(fitted_models()$cv %>% group_by(region) %>% summarize(CV = mean(cv)), 
           data.frame(region = "all", CV = mean(fitted_models()$globalcv)))
   })
   
-  # downloadable RData file with results
-  output$downloadData <- downloadHandler(
+  # downloadable RData file with capture histories
+  output$downloadHists <- downloadHandler(
     filename = function() {
-      paste0("cv_results.RData")
+      paste0("simulated_capthists.RData")
     },
     content = function(file) {
-      ex <- existing_pts() %>% st_set_geometry(NULL) %>% mutate(status = "existing") %>% select(pt_id, lat, lng, status, stratum_id, gridcell_id)
-      new <- new_pts() %>% st_set_geometry(NULL) %>% mutate(status = "new") %>% select(pt_id, lat, lng, status, stratum_id, gridcell_id)
+      
+      mesh <- update_region_lists$all_region_mesh
+      traps <- update_region_lists$all_region_traps
+      pars <- update_region_lists$all_region_pars
+      capthists <- capture_histories()$sim_ch
+
+      save(mesh, traps, pars, capthists, file = file)
+      }
+  )
+  
+  output$downloadModels <- downloadHandler(
+    filename = function() {
+      paste0("simulated_models.RData")
+    },
+    content = function(file) {
+      
       mesh <- update_region_lists$all_region_mesh
       traps <- update_region_lists$all_region_traps
       pars <- update_region_lists$all_region_pars
@@ -258,10 +271,11 @@ server <- function(input, output, session) {
       models <- fitted_models()$mods
       cvs <- fitted_models()$cv
       globalcv <- fitted_models()$globalcv
-      cv_results <- list(mesh = mesh, traps = traps, pars = pars, capthists = capthists, models = models, cvs = cvs, globalcv = globalcv)
-      save(cv_results, file)
+      
+      save(mesh, traps, pars, capthists, models, cvs, globalcv, file = file)
     }
   )
+  
   
 }
 
